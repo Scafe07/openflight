@@ -23,6 +23,46 @@ AutoExposureStatus = Literal[
     "unavailable",
 ]
 
+# ---------------------------------------------------------------------------
+# Tunable thresholds (8-bit grayscale, measured inside the impact-zone ROI)
+#
+# The ROI is mostly background (mat/turf/wall) with a small ball and clubhead.
+# Whole-ROI statistics such as the median and p90 therefore describe the
+# background, not the ball. A dark, uncluttered background is actually ideal
+# for IR capture, so darkness is judged by the brightest meaningful feature
+# (p99) rather than by median/contrast, and brightness is judged by how much
+# of the ROI is blown out.
+# ---------------------------------------------------------------------------
+
+# Percentile used as the "bright feature" (ball / club highlight) signal.
+BRIGHT_FEATURE_PERCENTILE = 99.0
+
+# too_dark: nothing in the ROI is bright enough to image a ball or clubhead.
+NEARLY_BLACK_PEAK = 25.0
+TOO_DARK_PEAK = 60.0
+
+# too_bright: a large part of the ROI is saturated, or the whole scene is washed out.
+TOO_BRIGHT_CLIPPED_PCT = 20.0
+TOO_BRIGHT_MEDIAN = 225.0
+
+# good: comfortably exposed. Anything between good and the failure limits is "marginal"
+# and is still accepted for analysis.
+GOOD_PEAK_MIN = 110.0
+GOOD_MEDIAN_MAX = 190.0
+GOOD_CLIPPED_MAX_PCT = 4.0
+
+# Last-resort acceptance. When the controller cannot move any further (end of the
+# ladder) or runs out of startup adjustments, an image that is imperfect but not
+# catastrophic is accepted instead of reporting "lighting required".
+TOLERABLE_MIN_PEAK = 40.0
+TOLERABLE_MAX_CLIPPED_PCT = 35.0
+TOLERABLE_MAX_MEDIAN = 240.0
+
+# Startup targeting: aim the bright feature at this level when brightening, and
+# the scene median at this level when darkening.
+BRIGHTER_TARGET_PEAK = 170.0
+DARKER_TARGET_MEDIAN = 110.0
+
 
 @dataclass(frozen=True)
 class ExposureStep:
@@ -43,6 +83,11 @@ class ExposureStep:
 
 
 EXPOSURE_STEPS = (
+    # Very bright conditions (direct sun, white surfaces). These extend the ladder below the
+    # original 100us/2.0 floor so outdoor scenes have somewhere to go. Validate on hardware
+    # with calibrate_camera_exposure.py (--exposures-us 60,80 --gains 1,1.5) before release.
+    ExposureStep(60, 1.0),
+    ExposureStep(80, 1.5),
     ExposureStep(100, 2.0),
     ExposureStep(150, 3.0),
     ExposureStep(200, 3.0),
@@ -74,11 +119,34 @@ class ExposureObservation:
     contrast: float | None = None
     clipped_pct: float | None = None
     dark_pct: float | None = None
+    p99: float | None = None
 
     @property
     def acceptable(self) -> bool:
         """Whether camera-derived metrics may use frames with this exposure."""
         return self.status in {"good", "marginal"}
+
+    @property
+    def tolerable(self) -> bool:
+        """Whether the frame is usable enough to accept when no better setting exists.
+
+        Used only when the controller cannot improve the exposure any further.
+        Rejects frames that are effectively black or almost entirely saturated.
+        """
+        if not self.sample_available:
+            return False
+        if self.status in {"good", "marginal"}:
+            return True
+        if self.status == "too_bright":
+            return (
+                (self.clipped_pct if self.clipped_pct is not None else 100.0)
+                < TOLERABLE_MAX_CLIPPED_PCT
+                and (self.median if self.median is not None else 255.0) < TOLERABLE_MAX_MEDIAN
+            )
+        if self.status == "too_dark":
+            peak = self.p99 if self.p99 is not None else self.p90
+            return peak is not None and peak >= TOLERABLE_MIN_PEAK
+        return False
 
     def to_dict(self) -> dict:
         """Serialize the observation for logs and the operator UI."""
@@ -149,29 +217,39 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
             message="Impact-area exposure region is unavailable",
         )
 
-    p10, median, p90 = (float(np.percentile(region, value)) for value in (10, 50, 90))
+    p10, median, p90, peak = (
+        float(np.percentile(region, value)) for value in (10, 50, 90, BRIGHT_FEATURE_PERCENTILE)
+    )
     clipped_pct = float(np.mean(region >= 250) * 100.0)
     dark_pct = float(np.mean(region <= 12) * 100.0)
     contrast = p90 - p10
 
-    if clipped_pct >= 8.0 or median >= 205.0:
+    if clipped_pct >= TOO_BRIGHT_CLIPPED_PCT or median >= TOO_BRIGHT_MEDIAN:
         status: ExposureQualityStatus = "too_bright"
         recommendation: ExposureRecommendation = "darker"
         message = "Impact area is clipping; reducing exposure"
-    elif p90 < 75.0 or median < 28.0 or contrast < 30.0:
+    elif peak < TOO_DARK_PEAK:
+        # Nothing bright enough to image the ball or clubhead. A dark background by itself
+        # (low median / low contrast) is fine and no longer counts against the image.
         status = "too_dark"
         recommendation = "brighter"
-        if p90 <= 12.0 and dark_pct >= 90.0:
+        if peak <= NEARLY_BLACK_PEAK and dark_pct >= 90.0:
             message = "Camera view is nearly black; check lighting and the lens cover"
         else:
-            message = "Club contrast is low; increasing exposure"
-    elif clipped_pct <= 2.0 and 45.0 <= median <= 180.0 and p90 >= 100.0:
+            message = "Ball and club are faint; increasing exposure"
+    elif (
+        clipped_pct <= GOOD_CLIPPED_MAX_PCT
+        and median <= GOOD_MEDIAN_MAX
+        and peak >= GOOD_PEAK_MIN
+    ):
         status = "good"
         recommendation = "hold"
         message = "Impact-area exposure and contrast look good"
     else:
         status = "marginal"
-        recommendation = "darker" if clipped_pct > 2.0 or median > 180.0 else "brighter"
+        recommendation = (
+            "darker" if clipped_pct > GOOD_CLIPPED_MAX_PCT or median > GOOD_MEDIAN_MAX else "brighter"
+        )
         message = f"Exposure is usable; a {recommendation} setting may improve contrast"
 
     return ExposureObservation(
@@ -185,6 +263,7 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
         contrast=round(contrast, 1),
         clipped_pct=round(clipped_pct, 2),
         dark_pct=round(dark_pct, 2),
+        p99=round(peak, 1),
     )
 
 
@@ -218,7 +297,7 @@ class AutoExposurePolicy:
         """Enter startup convergence and clear any prior locked result."""
         self._startup = True
         self._startup_adjustments = 0
-        self._locked_decision: AutoExposureDecision | None = None
+        self._locked_decision = None
 
     def reset(self) -> None:
         """Unlock the policy for a new camera startup."""
@@ -275,27 +354,11 @@ class AutoExposurePolicy:
         current = self.steps[current_index]
         risk = motion_blur_risk(current.exposure_us)
         if self._startup_adjustments >= self.startup_max_adjustments:
-            self._startup = False
-            self._locked_decision = AutoExposureDecision(
-                status="lighting_required",
-                analysis_eligible=False,
-                message=self._lighting_message(observation),
-                observation=observation,
-                motion_blur_risk=risk,
-            )
-            return self._locked_decision
+            return self._settle_without_convergence(observation, risk)
 
         target_index = self._startup_target_index(observation, current_index)
         if target_index == current_index:
-            self._startup = False
-            self._locked_decision = AutoExposureDecision(
-                status="lighting_required",
-                analysis_eligible=False,
-                message=self._lighting_message(observation),
-                observation=observation,
-                motion_blur_risk=risk,
-            )
-            return self._locked_decision
+            return self._settle_without_convergence(observation, risk)
 
         self._startup_adjustments += 1
         target = self.steps[target_index]
@@ -311,14 +374,49 @@ class AutoExposurePolicy:
             motion_blur_risk=motion_blur_risk(target.exposure_us),
         )
 
+    def _settle_without_convergence(
+        self,
+        observation: ExposureObservation,
+        risk: Literal["low", "elevated", "high"],
+    ) -> AutoExposureDecision:
+        """Lock a result when no better setting is reachable.
+
+        A frame that is imperfect but not catastrophic is accepted (analysis stays quality-gated
+        downstream). Only near-black or almost fully saturated frames report lighting_required.
+        """
+        self._startup = False
+        if observation.tolerable:
+            self._locked_decision = AutoExposureDecision(
+                status="ready",
+                analysis_eligible=True,
+                message="Best available exposure selected; image quality may be reduced",
+                observation=observation,
+                motion_blur_risk=risk,
+            )
+        else:
+            self._locked_decision = AutoExposureDecision(
+                status="lighting_required",
+                analysis_eligible=False,
+                message=self._lighting_message(observation),
+                observation=observation,
+                motion_blur_risk=risk,
+            )
+        return self._locked_decision
+
     def _startup_target_index(
         self,
         observation: ExposureObservation,
         current_index: int,
     ) -> int:
         current = self.steps[current_index]
-        median = max(float(observation.median or 1.0), 1.0)
-        target_signal = current.signal * max(0.125, min(8.0, 110.0 / median))
+        if observation.recommendation == "brighter":
+            # Dark backgrounds are fine, so scale by the bright feature (ball/club), not the median.
+            peak = observation.p99 if observation.p99 is not None else observation.median
+            scale = BRIGHTER_TARGET_PEAK / max(float(peak or 1.0), 1.0)
+        else:
+            median = max(float(observation.median or 1.0), 1.0)
+            scale = DARKER_TARGET_MEDIAN / median
+        target_signal = current.signal * max(0.125, min(8.0, scale))
         target_index = min(
             range(len(self.steps)),
             key=lambda index: abs(math.log(self.steps[index].signal / target_signal)),
