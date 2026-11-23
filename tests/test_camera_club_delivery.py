@@ -775,6 +775,17 @@ def _synthetic_capture(
     return frames, ts
 
 
+def _dim_room_capture(*, ball_bright: int, n_frames: int = 40) -> tuple[np.ndarray, np.ndarray]:
+    """Dim-room 320x200 capture: static background ~58 with a small ball (r=6 px)."""
+    rng = np.random.default_rng(11)
+    frames = np.full((n_frames, 200, 320), 58, dtype=np.uint8)
+    frames += rng.integers(0, 5, size=frames.shape, dtype=np.uint8)
+    yy, xx = np.mgrid[0:200, 0:320]
+    frames[:, (xx - 160) ** 2 + (yy - 130) ** 2 <= 6 * 6] = ball_bright
+    ts = (np.arange(n_frames) * (1e9 / 450.0)).astype(np.int64)
+    return frames, ts
+
+
 class TestTraceEstimation:
     def test_bright_scene_produces_trace(self):
         frames, ts = _synthetic_capture()
@@ -798,6 +809,41 @@ class TestTraceEstimation:
         assert result.trace_deg is None
         assert result.scene_p995 is not None
         assert result.scene_p995 < SCENE_P995_MIN
+
+    def test_dark_scene_with_small_bright_ball_is_not_low_light(self):
+        # Indoor/evening OV9281 capture (320x200, 600 us, gain 10): the room is dim
+        # (background p99.5 ~72, below SCENE_P995_MIN) but the ball is far above the
+        # ball-detection floor, so the scene is usable and must not be gated as low light.
+        frames, ts = _dim_room_capture(ball_bright=220)
+        result = estimate_delivery_trace(frames, ts)
+        assert result.scene_p995 is not None
+        assert result.scene_p995 < SCENE_P995_MIN
+        assert result.status != "low_light"
+
+    def test_dark_scene_with_small_bright_ball_chained_is_not_low_light(self):
+        frames, ts = _dim_room_capture(ball_bright=220)
+        result = estimate_chained_delivery(
+            frames,
+            ts,
+            trigger_index=30,
+            range_evidence=None,
+            geometry=CameraDeliveryGeometry(
+                camera_height_m=0.2032,
+                radar_height_m=0.1524,
+                tee_range_m=1.524,
+                ball_height_m=0.04,
+                image_width_px=320,
+                image_height_px=200,
+            ),
+            ops_club_speed_mph=80.0,
+        )
+        assert result.status != "rejected_low_light"
+
+    def test_dark_scene_without_bright_ball_is_still_low_light(self):
+        # Same dim room, but the ball is below the ball-detection floor.
+        frames, ts = _dim_room_capture(ball_bright=100)
+        result = estimate_delivery_trace(frames, ts)
+        assert result.status == "low_light"
 
     def test_saturation_near_ball_reports_overexposed(self):
         frames, ts = _synthetic_capture()

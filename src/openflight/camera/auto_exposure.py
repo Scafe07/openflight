@@ -179,10 +179,10 @@ class ExposureObservation:
             return True
         if self.status == "too_bright":
             return (
-                (self.clipped_pct if self.clipped_pct is not None else 100.0)
-                < TOLERABLE_MAX_CLIPPED_PCT
-                and (self.median if self.median is not None else 255.0) < TOLERABLE_MAX_MEDIAN
-            )
+                self.clipped_pct if self.clipped_pct is not None else 100.0
+            ) < TOLERABLE_MAX_CLIPPED_PCT and (
+                self.median if self.median is not None else 255.0
+            ) < TOLERABLE_MAX_MEDIAN
         if self.status == "too_dark":
             peak = self.peak if self.peak is not None else self.p90
             return peak is not None and peak >= TOLERABLE_MIN_PEAK
@@ -278,9 +278,7 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
         else:
             message = "Ball and club are faint; increasing exposure"
     elif (
-        clipped_pct <= GOOD_CLIPPED_MAX_PCT
-        and median <= GOOD_MEDIAN_MAX
-        and peak >= GOOD_PEAK_MIN
+        clipped_pct <= GOOD_CLIPPED_MAX_PCT and median <= GOOD_MEDIAN_MAX and peak >= GOOD_PEAK_MIN
     ):
         status = "good"
         recommendation = "hold"
@@ -288,7 +286,9 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
     else:
         status = "marginal"
         recommendation = (
-            "darker" if clipped_pct > GOOD_CLIPPED_MAX_PCT or median > GOOD_MEDIAN_MAX else "brighter"
+            "darker"
+            if clipped_pct > GOOD_CLIPPED_MAX_PCT or median > GOOD_MEDIAN_MAX
+            else "brighter"
         )
         message = f"Exposure is usable; a {recommendation} setting may improve contrast"
 

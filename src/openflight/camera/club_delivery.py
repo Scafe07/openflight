@@ -30,9 +30,13 @@ from openflight.clubs import ClubType
 from openflight.clubs.physics import get_club_physics
 
 # --- scene / mask constants -------------------------------------------------
-# Scene brightness gate: background 99.5th percentile. The 2026-08-07 session
+# Scene brightness: background 99.5th percentile. The 2026-08-07 session
 # measured p99 ~147 (9-iron block, clean traces), ~115 (5-iron, mask started
 # locking onto the ball) and ~66 (driver block, unusable).
+# A scene below this level is only reported as low light when the reference
+# ball cannot be detected: the percentile mostly describes the background (a
+# small ball covers ~0.2% of a 320x200 frame), so a dim room with a clearly
+# visible ball (p99.5 ~72, ball ~220) still yields a usable trace.
 SCENE_P995_MIN = 105.0
 # Over-exposure gates. Midday sun (2026-08-08 session) saturated large
 # scene regions; the reference-ball detector then locks onto arbitrary
@@ -918,8 +922,6 @@ def estimate_chained_delivery(
 
     background = np.median(frames[:15], axis=0).astype(np.uint8)
     scene_p995, _ball_threshold, bright_now, dark_bg = _adaptive_thresholds(background)
-    if scene_p995 < SCENE_P995_MIN:
-        return ChainedDelivery(status="rejected_low_light", scene_p995=scene_p995)
     ball = reference_ball
     if ball is None:
         try:
@@ -927,7 +929,12 @@ def estimate_chained_delivery(
         except ValueError:
             ball = ball_tracker.fallback() if ball_tracker is not None else None
             if ball is None:
-                return ChainedDelivery(status="rejected_no_ball", scene_p995=scene_p995)
+                return ChainedDelivery(
+                    status=_missing_ball_status(
+                        scene_p995, "rejected_low_light", "rejected_no_ball"
+                    ),
+                    scene_p995=scene_p995,
+                )
         else:
             if ball_tracker is not None:
                 ball, _ball_source = ball_tracker.resolve(ball)
@@ -1123,6 +1130,11 @@ def aoa_offset_for_club(club: ClubType) -> tuple[float, str]:
     return _DRIVER_OFFSET_DEG, "class_extrapolated"
 
 
+def _missing_ball_status(scene_p995: float, low_light: str, no_ball: str) -> str:
+    """Why no reference ball was found: a dim scene is the likelier cause than a missing ball."""
+    return low_light if scene_p995 < SCENE_P995_MIN else no_ball
+
+
 def _adaptive_thresholds(background: np.ndarray) -> tuple[float, float, float, float]:
     """(scene_p995, ball_threshold, bright_now, dark_bg) for one capture."""
     scene_p995 = float(np.percentile(background, 99.5))
@@ -1207,13 +1219,15 @@ def estimate_delivery_trace(
         return TraceResult(status="error", detail="frames must be (n>=20, h, w)")
     background = np.median(frames[:15], axis=0)
     scene_p995, ball_threshold, bright_now, dark_bg = _adaptive_thresholds(background)
-    if scene_p995 < SCENE_P995_MIN:
-        return TraceResult(status="low_light", scene_p995=scene_p995)
     saturated_global = float(np.mean(background >= 250))
     try:
         ball = detect_reference_ball(frames, brightness_threshold=int(ball_threshold))
     except ValueError:
-        status = "overexposed" if saturated_global > GLOBAL_SATURATION_HINT else "no_ball"
+        status = (
+            "overexposed"
+            if saturated_global > GLOBAL_SATURATION_HINT
+            else _missing_ball_status(scene_p995, "low_light", "no_ball")
+        )
         return TraceResult(
             status=status, scene_p995=scene_p995, detail=f"saturated_frac={saturated_global:.3f}"
         )

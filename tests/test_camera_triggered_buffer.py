@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from openflight.camera import capture_runtime
+from openflight.camera.auto_exposure import AutoExposurePolicy
 from openflight.camera.capture_runtime import (
     CameraCaptureRuntime,
     CameraCaptureSettings,
@@ -375,6 +376,7 @@ def test_auto_exposure_acceptable_frame_enables_camera_analysis(tmp_path):
     )
     runtime._camera = object()
     runtime._running = True
+    runtime._auto_exposure_policy = AutoExposurePolicy(fps=488.0, refine_max_steps=0)
     image = make_good_exposure_image()
     runtime._ring.add_frame(
         CameraFrame(
@@ -408,6 +410,7 @@ def test_auto_exposure_locks_first_acceptable_startup_setting(tmp_path):
     )
     runtime._camera = FakeCamera()
     runtime._running = True
+    runtime._auto_exposure_policy = AutoExposurePolicy(fps=488.0, refine_max_steps=0)
     runtime._ring.add_frame(
         CameraFrame(
             image=make_good_exposure_image(),
@@ -564,6 +567,7 @@ def test_auto_exposure_persists_good_controls(tmp_path):
     )
     runtime._camera = object()
     runtime._running = True
+    runtime._auto_exposure_policy = AutoExposurePolicy(fps=488.0, refine_max_steps=0)
     image = make_good_exposure_image()
     runtime._ring.add_frame(
         CameraFrame(
