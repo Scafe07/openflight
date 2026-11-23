@@ -85,6 +85,11 @@ REFINE_MIN_IMPROVEMENT = 0.05
 # Exposure penalty (motion blur): costs SCORE_EXPOSURE_WEIGHT per millisecond of shutter time.
 # At 2.0, trading 50 us of exposure for gain is worth about 10 points of lost ball contrast.
 SCORE_EXPOSURE_WEIGHT = 2.0
+
+# Gain above GAIN_COMFORT_LIMIT costs SCORE_GAIN_WEIGHT per unit (sensor noise). It is small
+# enough that a clearly too-dim image still moves up, but a good image stays at low gain.
+GAIN_COMFORT_LIMIT = 10.0
+SCORE_GAIN_WEIGHT = 0.1
 SCORE_PEAK_TARGET = 200.0
 SCORE_CONTRAST_TARGET = 100.0
 SCORE_CLIP_SCALE = 2.0
@@ -110,26 +115,30 @@ class ExposureStep:
 
 
 # The ladder is ordered by image brightness (exposure x gain). The clubhead and ball move fast,
-# so motion blur matters more than sensor noise: every level uses the shortest exposure that
-# keeps gain at or below 16 (18-20 only at the dimmest levels). Each level has roughly the same
-# brightness as the matching step in the old, balanced ladder, so scene-to-step behavior is
-# preserved while exposure shrinks 30-50% through the middle of the range.
+# so blur matters, but sensor noise from high gain also hurts edge quality. Each brightness
+# level therefore follows two rules:
+#   1. Normal lighting: gain rises to GAIN_COMFORT_LIMIT (10) first, then exposure grows at that
+#      gain, up to 750 us (motion_blur_risk reports "elevated" above 500 us).
+#   2. Dim lighting, where 750 us at gain 10 is not enough: gain may exceed the limit, but
+#      exposure stays as short as possible (gain up to 16, then 18-20 only for the dimmest levels).
 # Entries marked "new" are unvalidated pairs: confirm them with calibrate_camera_exposure.py.
 EXPOSURE_STEPS = (
     ExposureStep(60, 1.0),  # new: very bright conditions
     ExposureStep(80, 1.5),  # new: very bright conditions
     ExposureStep(100, 2.0),
-    ExposureStep(100, 3.0),  # new: fills the gap above 100/2.0
-    ExposureStep(100, 4.5),  # new (old 150/3.0)
-    ExposureStep(125, 5.0),  # new (old 200/3.0)
-    ExposureStep(150, 6.5, "Outdoor sun"),  # new (old 250/4.0)
-    ExposureStep(175, 8.0),  # new (old 300/5.0)
-    ExposureStep(200, 10.0, "Outdoor shade"),  # new (old 350/6.0)
-    ExposureStep(250, 12.0),  # new (old 400/8.0)
-    ExposureStep(300, 14.0, "Evening"),  # new (old 450/10.0)
-    ExposureStep(350, 16.0, "Indoor bright"),  # new (old 500/12.0)
-    ExposureStep(450, 16.0),  # new (old 500/15.0)
-    ExposureStep(600, 16.0, "Indoor dark"),  # new (old 650/15.0)
+    ExposureStep(100, 3.0),  # new
+    ExposureStep(100, 4.5),  # new
+    ExposureStep(125, 5.0),  # new
+    ExposureStep(150, 6.5, "Outdoor sun"),  # new
+    ExposureStep(175, 8.0),  # new
+    ExposureStep(200, 9.0),  # new
+    ExposureStep(250, 10.0, "Outdoor shade"),  # new
+    ExposureStep(325, 10.0),  # new
+    ExposureStep(400, 10.0),  # new
+    ExposureStep(500, 10.0, "Evening"),  # new
+    ExposureStep(600, 10.0, "Indoor bright"),  # new
+    ExposureStep(750, 10.0),  # new: end of the gain <= 10 range
+    ExposureStep(550, 16.0, "Indoor dark"),  # new: dim lighting begins (~ 9000, old 650/15)
     ExposureStep(800, 18.0),
     ExposureStep(1000, 20.0, "Night"),
     ExposureStep(1250, 16.0, "Facility dark"),
@@ -310,11 +319,12 @@ def motion_blur_risk(exposure_us: int) -> Literal["low", "elevated", "high"]:
 def exposure_quality_score(
     observation: ExposureObservation,
     exposure_us: int | None = None,
+    gain: float | None = None,
 ) -> float:
     """Rank frames so refinement can tell whether a step helped (higher is better).
 
-    Shorter exposure scores higher when exposure_us is given, because blur on the fast clubhead
-    and ball costs more than the extra gain noise needed to compensate.
+    Shorter exposure scores higher when exposure_us is given (blur on the fast clubhead and
+    ball), and gain above GAIN_COMFORT_LIMIT scores lower when gain is given (sensor noise).
     """
     if not observation.sample_available:
         return float("-inf")
@@ -322,12 +332,14 @@ def exposure_quality_score(
     clipped = observation.clipped_pct or 0.0
     median = observation.median or 0.0
     blur_penalty = SCORE_EXPOSURE_WEIGHT * (exposure_us or 0) / 1000.0
+    noise_penalty = SCORE_GAIN_WEIGHT * max(0.0, (gain or 0.0) - GAIN_COMFORT_LIMIT)
     return (
         min(peak, SCORE_PEAK_TARGET) / SCORE_PEAK_TARGET
         + min(max(peak - median, 0.0), SCORE_CONTRAST_TARGET) / SCORE_CONTRAST_TARGET
         - clipped / SCORE_CLIP_SCALE
         - max(0.0, median - GOOD_MEDIAN_MAX) / SCORE_MEDIAN_SCALE
         - blur_penalty
+        - noise_penalty
     )
 
 
@@ -454,6 +466,10 @@ class AutoExposurePolicy:
             motion_blur_risk=motion_blur_risk(target.exposure_us),
         )
 
+    def _score(self, observation: ExposureObservation, step_index: int) -> float:
+        step = self.steps[step_index]
+        return exposure_quality_score(observation, step.exposure_us, step.gain)
+
     def _refine_message(self) -> str:
         return f"Refining camera exposure ({self._refine_steps}/{self.refine_max_steps})"
 
@@ -492,7 +508,7 @@ class AutoExposurePolicy:
         self._best = (
             current_index,
             observation,
-            exposure_quality_score(observation, self.steps[current_index].exposure_us),
+            self._score(observation, current_index),
         )
         self._refine_direction = directions[0]
         self._probe_queue = directions[1:]
@@ -510,7 +526,7 @@ class AutoExposurePolicy:
         assert self._best is not None
         risk = motion_blur_risk(self.steps[current_index].exposure_us)
         best_index, _, best_score = self._best
-        score = exposure_quality_score(observation, self.steps[current_index].exposure_us)
+        score = self._score(observation, current_index)
         upgraded = observation.status == "good" and self._best[1].status != "good"
         improved = observation.acceptable and (
             upgraded or score > best_score + REFINE_MIN_IMPROVEMENT
@@ -520,7 +536,18 @@ class AutoExposurePolicy:
             self._best = (current_index, observation, score)
             self._probe_queue = []  # this direction helps, so the opposite side is not needed
             next_index = current_index + self._refine_direction
-            good_enough = observation.status == "good" and not self._climb_from_good
+            # A marginal start stops at the first "good" frame. The exception is a darker climb
+            # that is still above the gain comfort limit or has elevated blur risk: a
+            # lower-gain or shorter-exposure neighbor may be good too.
+            step = self.steps[current_index]
+            good_enough = (
+                observation.status == "good"
+                and not self._climb_from_good
+                and (
+                    self._refine_direction > 0
+                    or (step.gain <= GAIN_COMFORT_LIMIT and risk == "low")
+                )
+            )
             if (
                 good_enough
                 or self._refine_steps >= self.refine_max_steps
