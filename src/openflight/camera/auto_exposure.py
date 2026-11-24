@@ -138,20 +138,16 @@ class ExposureStep:
 EXPOSURE_STEPS = (
     ExposureStep(60, 1.0),  # new: very bright conditions
     ExposureStep(80, 1.5),  # new: very bright conditions
-    ExposureStep(100, 2.0),
-    ExposureStep(100, 3.0),  # new
-    ExposureStep(100, 4.5),  # new
-    ExposureStep(125, 5.0),  # new
-    ExposureStep(150, 6.5, "Outdoor sun"),  # new
-    ExposureStep(175, 8.0),  # new
-    ExposureStep(200, 9.0),  # new
-    ExposureStep(250, 10.0, "Outdoor shade"),  # new
-    ExposureStep(325, 10.0),  # new
-    ExposureStep(400, 10.0),  # new
-    ExposureStep(500, 10.0, "Evening"),  # new
-    ExposureStep(600, 10.0, "Indoor bright"),  # new
-    ExposureStep(750, 10.0),  # new: end of the gain <= 10 range
-    ExposureStep(550, 16.0, "Indoor dark"),  # new: dim lighting begins (~ 9000, old 650/15)
+    ExposureStep(150, 3.0),
+    ExposureStep(200, 3.0),
+    ExposureStep(250, 4.0, "Outdoor sun"),
+    ExposureStep(300, 5.0),
+    ExposureStep(350, 6.0, "Outdoor shade"),
+    ExposureStep(400, 8.0),
+    ExposureStep(450, 10.0, "Evening"),
+    ExposureStep(500, 12.0, "Indoor bright"),
+    ExposureStep(500, 15.0),
+    ExposureStep(650, 15.0, "Indoor dark"),
     ExposureStep(800, 18.0),
     ExposureStep(1000, 20.0, "Night"),
     ExposureStep(1250, 16.0, "Facility dark"),
