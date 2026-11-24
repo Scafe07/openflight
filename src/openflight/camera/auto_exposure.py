@@ -139,6 +139,7 @@ EXPOSURE_STEPS = (
     ExposureStep(60, 1.0),  # new: very bright conditions
     ExposureStep(80, 1.5),  # new: very bright conditions
     ExposureStep(150, 3.0),
+    ExposureStep(100, 2.0),
     ExposureStep(200, 3.0),
     ExposureStep(250, 4.0, "Outdoor sun"),
     ExposureStep(300, 5.0),
