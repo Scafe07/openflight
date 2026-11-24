@@ -104,6 +104,54 @@ def test_measure_exposure_accepts_dark_background_with_visible_ball():
     assert result.peak >= 200.0
 
 
+def ball_on_background(background, ball):
+    """Impact-zone frame: a flat background with one small ball (r=8 px)."""
+    image = np.full((200, 320), background, dtype=np.uint8)
+    yy, xx = np.mgrid[:200, :320]
+    image[(xx - 160) ** 2 + (yy - 130) ** 2 <= 8 * 8] = ball
+    return image
+
+
+def test_measure_exposure_flags_a_ball_washed_out_against_a_bright_background():
+    # White on white: the background is not blown out (median 200, nothing clipped) but the
+    # ball is only 35 gray levels above it, so it cannot be told apart.
+    result = measure_exposure(ball_on_background(200, 235))
+
+    assert result.status == "too_bright"
+    assert result.recommendation == "darker"
+    assert result.ball_contrast == pytest.approx(35.0)
+    assert "washed out" in result.message
+
+
+def test_measure_exposure_keeps_a_distinct_ball_on_a_bright_background():
+    result = measure_exposure(ball_on_background(170, 250))
+
+    assert result.status == "good"
+    assert result.ball_contrast == pytest.approx(80.0)
+
+
+def test_measure_exposure_is_not_good_when_the_ball_barely_stands_out():
+    # Mid-gray scene: nothing clipped or washed out, but the ball is only 30 levels brighter.
+    result = measure_exposure(ball_on_background(100, 130))
+
+    assert result.status == "marginal"
+    assert result.recommendation == "brighter"
+
+
+def test_measure_exposure_recommends_darker_for_low_contrast_on_a_bright_scene():
+    # Contrast 45: above the washed-out limit, below the good limit, with a bright median.
+    result = measure_exposure(ball_on_background(160, 205))
+
+    assert result.status == "marginal"
+    assert result.recommendation == "darker"
+
+
+def test_observation_reports_ball_contrast_in_its_payload():
+    result = measure_exposure(ball_on_background(60, 200))
+
+    assert result.to_dict()["ball_contrast"] == pytest.approx(140.0)
+
+
 def test_measure_exposure_flags_nearly_black_view():
     result = measure_exposure(np.zeros((200, 320), dtype=np.uint8))
 
@@ -248,13 +296,25 @@ def test_startup_attempt_limit_accepts_a_tolerable_dim_frame():
 def test_darkest_step_accepts_a_washed_out_but_usable_frame():
     policy = AutoExposurePolicy(fps=488.0)
     brightest_scene = observation(
-        "too_bright", "darker", median=235.0, peak=255.0, clipped_pct=22.0
+        "too_bright", "darker", median=150.0, peak=255.0, clipped_pct=22.0
     )
     darkest = EXPOSURE_STEPS[0]
 
     decision = policy.evaluate(brightest_scene, exposure_us=darkest.exposure_us, gain=darkest.gain)
 
     assert decision.status == "ready"
+
+
+def test_darkest_step_rejects_a_washed_out_frame_where_the_ball_is_lost():
+    policy = AutoExposurePolicy(fps=488.0)
+    washed_out = observation("too_bright", "darker", median=225.0, peak=245.0, clipped_pct=2.0)
+    darkest = EXPOSURE_STEPS[0]
+
+    decision = policy.evaluate(washed_out, exposure_us=darkest.exposure_us, gain=darkest.gain)
+
+    assert decision.status == "lighting_required"
+    assert decision.analysis_eligible is False
+    assert "overexposed" in decision.message
 
 
 def test_marginal_start_refines_and_stops_at_the_first_good_frame():

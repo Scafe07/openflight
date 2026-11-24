@@ -775,15 +775,28 @@ def _synthetic_capture(
     return frames, ts
 
 
-def _dim_room_capture(*, ball_bright: int, n_frames: int = 40) -> tuple[np.ndarray, np.ndarray]:
-    """Dim-room 320x200 capture: static background ~58 with a small ball (r=6 px)."""
+def _dim_room_capture(
+    *, ball_bright: int, scene_level: int = 58, n_frames: int = 40
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dim-room 320x200 capture: static background with a small ball (r=6 px), no club."""
     rng = np.random.default_rng(11)
-    frames = np.full((n_frames, 200, 320), 58, dtype=np.uint8)
+    frames = np.full((n_frames, 200, 320), scene_level, dtype=np.uint8)
     frames += rng.integers(0, 5, size=frames.shape, dtype=np.uint8)
     yy, xx = np.mgrid[0:200, 0:320]
     frames[:, (xx - 160) ** 2 + (yy - 130) ** 2 <= 6 * 6] = ball_bright
     ts = (np.arange(n_frames) * (1e9 / 450.0)).astype(np.int64)
     return frames, ts
+
+
+def _dim_room_geometry() -> CameraDeliveryGeometry:
+    return CameraDeliveryGeometry(
+        camera_height_m=0.2032,
+        radar_height_m=0.1524,
+        tee_range_m=1.524,
+        ball_height_m=0.04,
+        image_width_px=320,
+        image_height_px=200,
+    )
 
 
 class TestTraceEstimation:
@@ -827,14 +840,7 @@ class TestTraceEstimation:
             ts,
             trigger_index=30,
             range_evidence=None,
-            geometry=CameraDeliveryGeometry(
-                camera_height_m=0.2032,
-                radar_height_m=0.1524,
-                tee_range_m=1.524,
-                ball_height_m=0.04,
-                image_width_px=320,
-                image_height_px=200,
-            ),
+            geometry=_dim_room_geometry(),
             ops_club_speed_mph=80.0,
         )
         assert result.status != "rejected_low_light"
@@ -844,6 +850,69 @@ class TestTraceEstimation:
         frames, ts = _dim_room_capture(ball_bright=100)
         result = estimate_delivery_trace(frames, ts)
         assert result.status == "low_light"
+
+    def test_dark_room_with_session_anchor_reports_low_light_not_no_impact(self):
+        # Lights off after startup (600 us, gain 10): the ball is barely visible, so detection
+        # falls back to the session anchor and impact detection then finds nothing. The real
+        # cause is the dark scene, so that is what must be reported.
+        frames, ts = _dim_room_capture(ball_bright=78, scene_level=34)
+        tracker = ReferenceBallTracker()
+        for x in (159.0, 160.0, 161.0):
+            tracker.resolve_stable(ReferenceBall(x, 130.0, 14.0, 150))
+
+        result = estimate_chained_delivery(
+            frames,
+            ts,
+            trigger_index=30,
+            range_evidence=None,
+            geometry=_dim_room_geometry(),
+            ops_club_speed_mph=80.0,
+            ball_tracker=tracker,
+        )
+
+        assert result.status == "rejected_low_light"
+
+    def test_visible_ball_in_dim_room_without_a_club_still_reports_no_impact(self):
+        frames, ts = _dim_room_capture(ball_bright=220)
+        tracker = ReferenceBallTracker()
+        for x in (159.0, 160.0, 161.0):
+            tracker.resolve_stable(ReferenceBall(x, 130.0, 14.0, 150))
+
+        result = estimate_chained_delivery(
+            frames,
+            ts,
+            trigger_index=30,
+            range_evidence=None,
+            geometry=_dim_room_geometry(),
+            ops_club_speed_mph=80.0,
+            ball_tracker=tracker,
+        )
+
+        assert result.status == "rejected_no_impact"
+
+    def test_dark_room_trace_reports_low_light_when_impact_is_not_found(self, monkeypatch):
+        frames, ts = _dim_room_capture(ball_bright=78, scene_level=34)
+        monkeypatch.setattr(
+            club_delivery_module,
+            "detect_reference_ball",
+            lambda _frames, **_kwargs: ReferenceBall(160.0, 130.0, 14.0, 150),
+        )
+
+        result = estimate_delivery_trace(frames, ts, trigger_index=30)
+
+        assert result.status == "low_light"
+
+    def test_visible_ball_in_dim_room_trace_still_reports_no_impact(self, monkeypatch):
+        frames, ts = _dim_room_capture(ball_bright=220)
+        monkeypatch.setattr(
+            club_delivery_module,
+            "detect_reference_ball",
+            lambda _frames, **_kwargs: ReferenceBall(160.0, 130.0, 14.0, 150),
+        )
+
+        result = estimate_delivery_trace(frames, ts, trigger_index=30)
+
+        assert result.status == "no_impact"
 
     def test_saturation_near_ball_reports_overexposed(self):
         frames, ts = _synthetic_capture()

@@ -48,11 +48,24 @@ TOO_DARK_PEAK = 60.0
 TOO_BRIGHT_CLIPPED_PCT = 20.0
 TOO_BRIGHT_MEDIAN = 225.0
 
+# Ball contrast = peak (the ball) minus the ROI median (the background). The ball has to stand
+# out from the background to be tracked. On a bright scene a ball that does not stand out is
+# "white on white" even when little is clipped, so it counts as too bright:
+#   - WASHED_OUT_MEDIAN: backgrounds at or above this level are bright enough for that to matter;
+#   - MIN_BALL_CONTRAST: below this the ball cannot be told apart from the background.
+# Real frames (OV9281, 320x200, ball ~1% of the ROI) give 70-105 for good exposures and fall to
+# ~58 as gain pushes the background toward 200, so 40 only fires on clearly lost balls.
+WASHED_OUT_MEDIAN = 150.0
+MIN_BALL_CONTRAST = 40.0
+
 # good: comfortably exposed. Anything between good and the failure limits is "marginal"
 # and is still accepted for analysis.
 GOOD_PEAK_MIN = 110.0
 GOOD_MEDIAN_MAX = 190.0
 GOOD_CLIPPED_MAX_PCT = 4.0
+# A "good" frame also needs the ball to stand out; between MIN_BALL_CONTRAST and this it is
+# marginal. Real good exposures measured 70-105.
+GOOD_MIN_CONTRAST = 50.0
 
 # Last-resort acceptance. When the controller cannot move any further (end of the
 # ladder) or runs out of startup adjustments, an image that is imperfect but not
@@ -178,19 +191,30 @@ class ExposureObservation:
         if self.status in {"good", "marginal"}:
             return True
         if self.status == "too_bright":
+            contrast = self.ball_contrast
             return (
-                self.clipped_pct if self.clipped_pct is not None else 100.0
-            ) < TOLERABLE_MAX_CLIPPED_PCT and (
-                self.median if self.median is not None else 255.0
-            ) < TOLERABLE_MAX_MEDIAN
+                (self.clipped_pct if self.clipped_pct is not None else 100.0)
+                < TOLERABLE_MAX_CLIPPED_PCT
+                and (self.median if self.median is not None else 255.0) < TOLERABLE_MAX_MEDIAN
+                and (contrast is None or contrast >= MIN_BALL_CONTRAST)
+            )
         if self.status == "too_dark":
             peak = self.peak if self.peak is not None else self.p90
             return peak is not None and peak >= TOLERABLE_MIN_PEAK
         return False
 
+    @property
+    def ball_contrast(self) -> float | None:
+        """How far the ball (peak) stands above the background (median), when both are known."""
+        if self.peak is None or self.median is None:
+            return None
+        return round(self.peak - self.median, 1)
+
     def to_dict(self) -> dict:
         """Serialize the observation for logs and the operator UI."""
-        return asdict(self)
+        payload = asdict(self)
+        payload["ball_contrast"] = self.ball_contrast
+        return payload
 
 
 @dataclass(frozen=True)
@@ -263,11 +287,17 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
     clipped_pct = float(np.mean(region >= 250) * 100.0)
     dark_pct = float(np.mean(region <= 12) * 100.0)
     contrast = p90 - p10
+    ball_contrast = peak - median
+    washed_out = median >= WASHED_OUT_MEDIAN and ball_contrast < MIN_BALL_CONTRAST
 
-    if clipped_pct >= TOO_BRIGHT_CLIPPED_PCT or median >= TOO_BRIGHT_MEDIAN:
+    if clipped_pct >= TOO_BRIGHT_CLIPPED_PCT or median >= TOO_BRIGHT_MEDIAN or washed_out:
         status: ExposureQualityStatus = "too_bright"
         recommendation: ExposureRecommendation = "darker"
-        message = "Impact area is clipping; reducing exposure"
+        message = (
+            "Impact area is clipping; reducing exposure"
+            if clipped_pct >= TOO_BRIGHT_CLIPPED_PCT or median >= TOO_BRIGHT_MEDIAN
+            else "Ball is washed out against a bright background; reducing exposure"
+        )
     elif peak < TOO_DARK_PEAK:
         # Nothing bright enough to image the ball or clubhead. A dark background by itself
         # (low median / low contrast) is fine and no longer counts against the image.
@@ -278,18 +308,22 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
         else:
             message = "Ball and club are faint; increasing exposure"
     elif (
-        clipped_pct <= GOOD_CLIPPED_MAX_PCT and median <= GOOD_MEDIAN_MAX and peak >= GOOD_PEAK_MIN
+        clipped_pct <= GOOD_CLIPPED_MAX_PCT
+        and median <= GOOD_MEDIAN_MAX
+        and peak >= GOOD_PEAK_MIN
+        and ball_contrast >= GOOD_MIN_CONTRAST
     ):
         status = "good"
         recommendation = "hold"
         message = "Impact-area exposure and contrast look good"
     else:
         status = "marginal"
-        recommendation = (
-            "darker"
-            if clipped_pct > GOOD_CLIPPED_MAX_PCT or median > GOOD_MEDIAN_MAX
-            else "brighter"
+        too_bright_side = (
+            clipped_pct > GOOD_CLIPPED_MAX_PCT
+            or median > GOOD_MEDIAN_MAX
+            or (median >= WASHED_OUT_MEDIAN and ball_contrast < GOOD_MIN_CONTRAST)
         )
+        recommendation = "darker" if too_bright_side else "brighter"
         message = f"Exposure is usable; a {recommendation} setting may improve contrast"
 
     return ExposureObservation(

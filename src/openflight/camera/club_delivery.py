@@ -58,6 +58,7 @@ BRIGHT_NOW_SCALE = 0.85  # fraction of the background's brightest content
 DARK_BG_MARGIN = 25.0
 BALL_THRESHOLD_FLOOR = 120.0
 BALL_THRESHOLD_SCALE = 0.9
+BALL_PEAK_PERCENTILE = 99.95
 
 BALL_PATCH_RADIUS_FRAC = 0.4
 BALL_PRESENT_DELTA = 30.0
@@ -947,7 +948,12 @@ def estimate_chained_delivery(
 
     impact_idx = _detect_impact_index(frames, ball, trigger_index=trigger_index)
     if impact_idx is None:
-        return ChainedDelivery(status="rejected_no_impact", scene_p995=scene_p995)
+        return ChainedDelivery(
+            status=_dim_scene_status(
+                background, scene_p995, "rejected_low_light", "rejected_no_impact"
+            ),
+            scene_p995=scene_p995,
+        )
     impact_vs_trigger_ms = None
     timing_plausible = trigger_index is None and camera_quality_clean
     if trigger_index is not None:
@@ -1130,6 +1136,25 @@ def aoa_offset_for_club(club: ClubType) -> tuple[float, str]:
     return _DRIVER_OFFSET_DEG, "class_extrapolated"
 
 
+def _dim_scene_status(
+    background: np.ndarray, scene_p995: float, low_light: str, default: str
+) -> str:
+    """Relabel a post-detection failure as low light when nothing bright enough was seen.
+
+    A dim scene whose brightest content is below the ball-detection floor cannot give the
+    reference ball or the club a usable mask, so a failure there (for example no impact found
+    after falling back to the session ball anchor) is a lighting problem. A dim scene with a
+    clearly bright ball keeps its specific status.
+    """
+    dim = scene_p995 < SCENE_P995_MIN and _ball_peak(background) < BALL_THRESHOLD_FLOOR
+    return low_light if dim else default
+
+
+def _ball_peak(background: np.ndarray) -> float:
+    """Brightest meaningful scene content (the ball): background 99.95th percentile."""
+    return float(np.percentile(background, BALL_PEAK_PERCENTILE))
+
+
 def _missing_ball_status(scene_p995: float, low_light: str, no_ball: str) -> str:
     """Why no reference ball was found: a dim scene is the likelier cause than a missing ball."""
     return low_light if scene_p995 < SCENE_P995_MIN else no_ball
@@ -1138,7 +1163,7 @@ def _missing_ball_status(scene_p995: float, low_light: str, no_ball: str) -> str
 def _adaptive_thresholds(background: np.ndarray) -> tuple[float, float, float, float]:
     """(scene_p995, ball_threshold, bright_now, dark_bg) for one capture."""
     scene_p995 = float(np.percentile(background, 99.5))
-    top = float(np.percentile(background, 99.95))
+    top = _ball_peak(background)
     ball_threshold = max(BALL_THRESHOLD_FLOOR, BALL_THRESHOLD_SCALE * top)
     bright_now = max(BRIGHT_NOW_FLOOR, BRIGHT_NOW_SCALE * top)
     dark_bg = bright_now - DARK_BG_MARGIN
@@ -1244,7 +1269,10 @@ def estimate_delivery_trace(
         )
     impact_idx = _detect_impact_index(frames, ball, trigger_index=trigger_index)
     if impact_idx is None:
-        return TraceResult(status="no_impact", scene_p995=scene_p995)
+        return TraceResult(
+            status=_dim_scene_status(background, scene_p995, "low_light", "no_impact"),
+            scene_p995=scene_p995,
+        )
     if trigger_index is not None and not (
         trigger_index - IMPACT_PRE_TRIGGER_MAX
         <= impact_idx
