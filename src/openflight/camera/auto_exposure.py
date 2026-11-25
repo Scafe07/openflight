@@ -71,7 +71,7 @@ GOOD_MEDIAN_MAX = 190.0
 # peak of 237 but scene p90 ~66 (club region peaking at 89) were rejected on every shot because the
 # club mask needs pixels above 110, while scene p90 ~100 (club region 150) was detected on every
 # shot. A brighter ball alone does not make a frame good; the scene has to reach this level too.
-GOOD_SCENE_P90_MIN = 90.0
+GOOD_SCENE_P90_MIN = 100.0
 GOOD_CLIPPED_MAX_PCT = 4.0
 # A "good" frame also needs the ball to stand out; between MIN_BALL_CONTRAST and this it is
 # marginal. Real good exposures measured 70-105.
