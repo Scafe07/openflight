@@ -175,10 +175,19 @@ def test_measure_exposure_is_not_good_when_the_scene_is_dim_even_if_the_ball_is_
 
 
 def test_measure_exposure_is_good_when_the_scene_is_lit_well_enough_for_the_club():
-    # Real range frame at 800us/18: scene p90 ~100, club visible.
-    result = measure_exposure(ball_on_background(96, 250))
+    # Real range frame at 800us/18: scene p90 ~100-105, club visible.
+    result = measure_exposure(ball_on_background(104, 250))
 
     assert result.status == "good"
+
+
+def test_measure_exposure_is_not_good_when_the_scene_is_just_below_the_club_threshold():
+    # Real range frame at 650us/15: scene p90 96 locked here and only 2 of 4 club paths and 0 of 4
+    # horizontal launch angles registered, so it must keep brightening.
+    result = measure_exposure(ball_on_background(96, 250))
+
+    assert result.status == "marginal"
+    assert result.recommendation == "brighter"
 
 
 def test_quality_score_rewards_a_brighter_scene_when_the_ball_is_already_bright():
