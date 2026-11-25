@@ -93,13 +93,15 @@ def test_measure_exposure_classifies_impact_zone(value, expected):
 
 
 def test_measure_exposure_accepts_dark_background_with_visible_ball():
+    # Never "too dark" when the ball is visible; a dim scene is only "marginal" (accepted).
     image = np.full((200, 320), 58, dtype=np.uint8)
     yy, xx = np.mgrid[:200, :320]
     image[(xx - 160) ** 2 + (yy - 130) ** 2 <= 6 * 6] = 220
 
     result = measure_exposure(image)
 
-    assert result.status == "good"
+    assert result.status == "marginal"
+    assert result.acceptable is True
     assert result.peak >= 200.0
 
 
@@ -140,7 +142,7 @@ def test_measure_exposure_is_not_good_when_the_ball_is_near_the_detection_floor(
 
 
 def test_measure_exposure_is_good_when_the_ball_clears_the_detection_floor_with_margin():
-    result = measure_exposure(ball_on_background(60, 160))
+    result = measure_exposure(ball_on_background(100, 200))
 
     assert result.status == "good"
 
@@ -159,6 +161,43 @@ def test_measure_exposure_recommends_darker_for_low_contrast_on_a_bright_scene()
 
     assert result.status == "marginal"
     assert result.recommendation == "darker"
+
+
+def test_measure_exposure_is_not_good_when_the_scene_is_dim_even_if_the_ball_is_bright():
+    # Real range frame at 500us/12: ball 237 but the surrounding scene (and the club) sits near
+    # gray 60-90, below what the club mask needs, so every shot was rejected as low light.
+    result = measure_exposure(ball_on_background(66, 237))
+
+    assert result.status == "marginal"
+    assert result.recommendation == "brighter"
+    assert result.sample_available is True
+    assert result.acceptable is True
+
+
+def test_measure_exposure_is_good_when_the_scene_is_lit_well_enough_for_the_club():
+    # Real range frame at 800us/18: scene p90 ~100, club visible.
+    result = measure_exposure(ball_on_background(96, 250))
+
+    assert result.status == "good"
+
+
+def test_quality_score_rewards_a_brighter_scene_when_the_ball_is_already_bright():
+    dim_scene = observation("marginal", "brighter", median=58.0, p90=66.0, peak=161.0)
+    lit_scene = observation("good", "hold", median=91.0, p90=105.0, peak=161.0)
+
+    assert exposure_quality_score(lit_scene) > exposure_quality_score(dim_scene)
+
+
+def test_refinement_brightens_when_only_the_scene_is_dim():
+    policy = AutoExposurePolicy(fps=488.0)
+    dim = observation("marginal", "brighter", median=58.0, p90=66.0, peak=162.0)
+    lit = observation("good", "hold", median=91.0, p90=100.0, peak=165.0)
+
+    decisions, final = run_policy(policy, [dim, lit], start=start_at(11))
+
+    assert decisions[0].target == EXPOSURE_STEPS[12]
+    assert decisions[-1].status == "ready"
+    assert final == start_at(12)
 
 
 def test_observation_reports_ball_contrast_in_its_payload():

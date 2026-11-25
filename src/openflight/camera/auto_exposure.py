@@ -66,6 +66,12 @@ MIN_BALL_CONTRAST = 40.0
 # rejected as low light even though calibration rated them good, so require clear headroom.
 GOOD_PEAK_MIN = 150.0
 GOOD_MEDIAN_MAX = 190.0
+# The scene (not just the ball) must be lit well enough to see the club. The ball is ~1% of the
+# ROI, so the ROI p90 describes the background, ground and clubhead. Range captures with a ball
+# peak of 237 but scene p90 ~66 (club region peaking at 89) were rejected on every shot because the
+# club mask needs pixels above 110, while scene p90 ~100 (club region 150) was detected on every
+# shot. A brighter ball alone does not make a frame good; the scene has to reach this level too.
+GOOD_SCENE_P90_MIN = 90.0
 GOOD_CLIPPED_MAX_PCT = 4.0
 # A "good" frame also needs the ball to stand out; between MIN_BALL_CONTRAST and this it is
 # marginal. Real good exposures measured 70-105.
@@ -113,6 +119,9 @@ SCORE_PEAK_TARGET = 200.0
 # club and ball masks need that headroom, so a step that closes the gap is worth the extra blur or
 # gain it costs. Once the ball clears GOOD_PEAK_MIN the term is zero and those penalties decide.
 SCORE_PEAK_SHORTFALL_SCALE = 25.0
+# Scene p90 below GOOD_SCENE_P90_MIN costs 1.0 per SCORE_SCENE_SHORTFALL_SCALE levels, for the same
+# reason: a step that lights the club is worth its extra gain or blur.
+SCORE_SCENE_SHORTFALL_SCALE = 20.0
 SCORE_CONTRAST_TARGET = 100.0
 SCORE_CLIP_SCALE = 2.0
 SCORE_MEDIAN_SCALE = 50.0
@@ -314,6 +323,7 @@ def measure_exposure(image: np.ndarray) -> ExposureObservation:
         clipped_pct <= GOOD_CLIPPED_MAX_PCT
         and median <= GOOD_MEDIAN_MAX
         and peak >= GOOD_PEAK_MIN
+        and p90 >= GOOD_SCENE_P90_MIN
         and ball_contrast >= GOOD_MIN_CONTRAST
     ):
         status = "good"
@@ -368,6 +378,7 @@ def exposure_quality_score(
     peak = observation.peak if observation.peak is not None else (observation.p90 or 0.0)
     clipped = observation.clipped_pct or 0.0
     median = observation.median or 0.0
+    scene = observation.p90 if observation.p90 is not None else GOOD_SCENE_P90_MIN
     blur_penalty = SCORE_EXPOSURE_WEIGHT * (exposure_us or 0) / 1000.0
     noise_penalty = SCORE_GAIN_WEIGHT * max(0.0, (gain or 0.0) - GAIN_COMFORT_LIMIT)
     return (
@@ -376,6 +387,7 @@ def exposure_quality_score(
         - clipped / SCORE_CLIP_SCALE
         - max(0.0, median - GOOD_MEDIAN_MAX) / SCORE_MEDIAN_SCALE
         - max(0.0, GOOD_PEAK_MIN - peak) / SCORE_PEAK_SHORTFALL_SCALE
+        - max(0.0, GOOD_SCENE_P90_MIN - scene) / SCORE_SCENE_SHORTFALL_SCALE
         - blur_penalty
         - noise_penalty
     )
