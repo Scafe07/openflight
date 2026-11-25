@@ -60,7 +60,11 @@ MIN_BALL_CONTRAST = 40.0
 
 # good: comfortably exposed. Anything between good and the failure limits is "marginal"
 # and is still accepted for analysis.
-GOOD_PEAK_MIN = 110.0
+# The ball must clear the downstream detection floors with margin: club_delivery needs ball pixels
+# above BALL_THRESHOLD_FLOOR (120) and a moving-bright club mask above max(110, 0.85 x ball peak).
+# Range captures at ball peak 174 passed club path and AOA, while captures at 116 were mostly
+# rejected as low light even though calibration rated them good, so require clear headroom.
+GOOD_PEAK_MIN = 150.0
 GOOD_MEDIAN_MAX = 190.0
 GOOD_CLIPPED_MAX_PCT = 4.0
 # A "good" frame also needs the ball to stand out; between MIN_BALL_CONTRAST and this it is
@@ -104,6 +108,11 @@ SCORE_EXPOSURE_WEIGHT = 2.0
 GAIN_COMFORT_LIMIT = 10.0
 SCORE_GAIN_WEIGHT = 0.1
 SCORE_PEAK_TARGET = 200.0
+# Ball peak below GOOD_PEAK_MIN costs 1.0 per SCORE_PEAK_SHORTFALL_SCALE levels. A ball that cannot
+# be detected makes blur avoidance moot, so this outweighs the exposure and gain penalties: the
+# club and ball masks need that headroom, so a step that closes the gap is worth the extra blur or
+# gain it costs. Once the ball clears GOOD_PEAK_MIN the term is zero and those penalties decide.
+SCORE_PEAK_SHORTFALL_SCALE = 25.0
 SCORE_CONTRAST_TARGET = 100.0
 SCORE_CLIP_SCALE = 2.0
 SCORE_MEDIAN_SCALE = 50.0
@@ -127,19 +136,16 @@ class ExposureStep:
         return asdict(self)
 
 
-# The ladder is ordered by image brightness (exposure x gain). The clubhead and ball move fast,
-# so blur matters, but sensor noise from high gain also hurts edge quality. Each brightness
-# level therefore follows two rules:
-#   1. Normal lighting: gain rises to GAIN_COMFORT_LIMIT (10) first, then exposure grows at that
-#      gain, up to 750 us (motion_blur_risk reports "elevated" above 500 us).
-#   2. Dim lighting, where 750 us at gain 10 is not enough: gain may exceed the limit, but
-#      exposure stays as short as possible (gain up to 16, then 18-20 only for the dimmest levels).
-# Entries marked "new" are unvalidated pairs: confirm them with calibrate_camera_exposure.py.
+# The ladder is ordered by image brightness (exposure x gain): the controller steps "brighter" and
+# "darker" by index, so every entry must be at least as bright as the one before it (a test
+# enforces this). Entries marked "new" are unvalidated pairs for very bright scenes: confirm
+# them with calibrate_camera_exposure.py.
 EXPOSURE_STEPS = (
     ExposureStep(60, 1.0),  # new: very bright conditions
     ExposureStep(80, 1.5),  # new: very bright conditions
-    ExposureStep(150, 3.0),
     ExposureStep(100, 2.0),
+    ExposureStep(100, 3.0),  # new: splits the 2.25x jump between 100/2.0 and 150/3.0
+    ExposureStep(150, 3.0),
     ExposureStep(200, 3.0),
     ExposureStep(250, 4.0, "Outdoor sun"),
     ExposureStep(300, 5.0),
@@ -151,7 +157,7 @@ EXPOSURE_STEPS = (
     ExposureStep(650, 15.0, "Indoor dark"),
     ExposureStep(800, 18.0),
     ExposureStep(1000, 20.0, "Night"),
-    ExposureStep(1250, 16.0, "Facility dark"),
+    ExposureStep(1250, 20.0, "Facility dark"),  # was 1250/16.0, the same brightness as 1000/20.0
 )
 
 
@@ -369,6 +375,7 @@ def exposure_quality_score(
         + min(max(peak - median, 0.0), SCORE_CONTRAST_TARGET) / SCORE_CONTRAST_TARGET
         - clipped / SCORE_CLIP_SCALE
         - max(0.0, median - GOOD_MEDIAN_MAX) / SCORE_MEDIAN_SCALE
+        - max(0.0, GOOD_PEAK_MIN - peak) / SCORE_PEAK_SHORTFALL_SCALE
         - blur_penalty
         - noise_penalty
     )

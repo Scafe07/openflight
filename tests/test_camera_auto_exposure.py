@@ -5,7 +5,6 @@ import pytest
 
 from openflight.camera.auto_exposure import (
     EXPOSURE_STEPS,
-    GAIN_COMFORT_LIMIT,
     AutoExposurePolicy,
     ExposureObservation,
     exposure_quality_score,
@@ -34,13 +33,10 @@ def observation(  # pylint: disable=too-many-arguments
     )
 
 
-def step_index(exposure_us, gain):
-    """Index of one exact ladder step."""
-    return next(
-        index
-        for index, step in enumerate(EXPOSURE_STEPS)
-        if (step.exposure_us, step.gain) == (exposure_us, gain)
-    )
+def start_at(index):
+    """(exposure_us, gain) of the ladder step at ``index``."""
+    step = EXPOSURE_STEPS[index]
+    return step.exposure_us, step.gain
 
 
 def run_policy(policy, observations, *, start):
@@ -57,12 +53,15 @@ def run_policy(policy, observations, *, start):
     return decisions, (exposure_us, gain)
 
 
-def test_ladder_keeps_gain_at_comfort_limit_until_750us():
-    first_high_gain = next(
-        index for index, step in enumerate(EXPOSURE_STEPS) if step.gain > GAIN_COMFORT_LIMIT
-    )
-    assert EXPOSURE_STEPS[first_high_gain - 1] == EXPOSURE_STEPS[step_index(750, 10.0)]
-    assert all(step.gain <= GAIN_COMFORT_LIMIT for step in EXPOSURE_STEPS[:first_high_gain])
+def test_every_ladder_step_is_brighter_than_the_one_before():
+    # A step with the same brightness as its predecessor adds blur or noise but no light.
+    signals = [step.signal for step in EXPOSURE_STEPS]
+    assert all(later > earlier for earlier, later in zip(signals, signals[1:]))
+
+
+def test_no_ladder_step_is_more_than_two_times_brighter_than_the_last():
+    signals = [step.signal for step in EXPOSURE_STEPS]
+    assert max(later / earlier for earlier, later in zip(signals, signals[1:])) <= 2.0 + 1e-9
 
 
 def test_exposure_ladder_is_monotonic_and_respects_frame_period():
@@ -130,6 +129,22 @@ def test_measure_exposure_keeps_a_distinct_ball_on_a_bright_background():
     assert result.ball_contrast == pytest.approx(80.0)
 
 
+def test_measure_exposure_is_not_good_when_the_ball_is_near_the_detection_floor():
+    # Ball at 135 on a 60 background: plenty of contrast, but only just above the level the
+    # ball and club masks need downstream (captures at this level were mostly rejected as
+    # low light), so keep brightening.
+    result = measure_exposure(ball_on_background(60, 135))
+
+    assert result.status == "marginal"
+    assert result.recommendation == "brighter"
+
+
+def test_measure_exposure_is_good_when_the_ball_clears_the_detection_floor_with_margin():
+    result = measure_exposure(ball_on_background(60, 160))
+
+    assert result.status == "good"
+
+
 def test_measure_exposure_is_not_good_when_the_ball_barely_stands_out():
     # Mid-gray scene: nothing clipped or washed out, but the ball is only 30 levels brighter.
     result = measure_exposure(ball_on_background(100, 130))
@@ -170,7 +185,12 @@ def test_startup_dark_scene_jumps_more_than_one_step():
 
     assert decision.status == "adjusting"
     assert decision.target is not None
-    assert decision.target.signal > EXPOSURE_STEPS[4].signal
+    start_index = next(
+        index
+        for index, step in enumerate(EXPOSURE_STEPS)
+        if (step.exposure_us, step.gain) == (250, 4.0)
+    )
+    assert decision.target.signal > EXPOSURE_STEPS[start_index + 1].signal
     assert decision.analysis_eligible is False
 
 
@@ -322,26 +342,26 @@ def test_marginal_start_refines_and_stops_at_the_first_good_frame():
     marginal = observation("marginal", "brighter", median=60.0, peak=100.0)
     good = observation("good", "hold", median=62.0, peak=185.0)
 
-    decisions, final = run_policy(policy, [marginal, good], start=(200, 9.0))
+    decisions, final = run_policy(policy, [marginal, good], start=start_at(5))
 
     assert decisions[0].status == "adjusting"
-    assert decisions[0].target == EXPOSURE_STEPS[step_index(200, 9.0) + 1]
+    assert decisions[0].target == EXPOSURE_STEPS[6]
     assert decisions[-1].status == "ready"
-    assert final == (EXPOSURE_STEPS[step_index(200, 9.0) + 1].exposure_us, 10.0)
+    assert final == start_at(6)
     assert policy.startup is False
 
 
 def test_good_start_probes_darker_then_brighter_and_restores_the_best_step():
     policy = AutoExposurePolicy(fps=488.0)
-    start = (325, 10.0)
+    start = start_at(8)
     good = observation("good", "hold", median=100.0, peak=210.0)
     worse = observation("good", "hold", median=100.0, peak=150.0)
 
     decisions, final = run_policy(policy, [good, worse, worse, good], start=start)
 
     probes = [decision.target for decision in decisions if decision.target is not None]
-    assert probes[0] == EXPOSURE_STEPS[step_index(*start) - 1]  # darker first
-    assert probes[1] == EXPOSURE_STEPS[step_index(*start) + 1]  # then brighter
+    assert probes[0] == EXPOSURE_STEPS[7]  # darker first
+    assert probes[1] == EXPOSURE_STEPS[9]  # then brighter
     assert decisions[-1].status == "ready"
     assert final == start
     assert policy.startup is False
@@ -349,7 +369,7 @@ def test_good_start_probes_darker_then_brighter_and_restores_the_best_step():
 
 def test_refinement_follows_a_shorter_exposure_that_scores_better():
     policy = AutoExposurePolicy(fps=488.0)
-    start = (450, 10.0)
+    start = start_at(9)
     better = observation("good", "hold", median=80.0, peak=215.0)
     good = observation("good", "hold", median=120.0, peak=215.0)
 
@@ -361,9 +381,39 @@ def test_refinement_follows_a_shorter_exposure_that_scores_better():
     assert final[0] < start[0]
 
 
+def test_refinement_keeps_brightening_through_marginal_frames_until_the_ball_is_good():
+    # Each step up costs more gain/exposure than its small peak gain is worth on its own, but
+    # the ball is still below the "good" peak, so the climb must continue until it clears it.
+    policy = AutoExposurePolicy(fps=488.0)
+    first = observation("marginal", "brighter", median=50.0, peak=127.0)
+    second = observation("marginal", "brighter", median=55.0, peak=140.0)
+    third = observation("good", "hold", median=60.0, peak=172.0)
+
+    decisions, final = run_policy(policy, [first, second, third], start=start_at(10))
+
+    assert decisions[-1].status == "ready"
+    assert final == start_at(12)
+
+
+def test_refinement_climbs_to_the_end_of_the_ladder_when_the_ball_is_far_below_good():
+    # A very dim scene: each step up adds blur and gain, but the ball is nowhere near bright
+    # enough for the club and ball masks, so the climb must not stop early.
+    policy = AutoExposurePolicy(fps=488.0)
+    dim = [
+        observation("marginal", "brighter", median=17.0, peak=61.0),
+        observation("marginal", "brighter", median=23.0, peak=81.0),
+        observation("marginal", "brighter", median=28.0, peak=97.0),
+    ]
+
+    decisions, final = run_policy(policy, dim, start=start_at(len(EXPOSURE_STEPS) - 3))
+
+    assert decisions[-1].status == "ready"
+    assert final == start_at(-1)
+
+
 def test_refinement_is_bounded_by_the_step_budget():
     policy = AutoExposurePolicy(fps=488.0, refine_max_steps=2)
-    start = (150, 6.5)
+    start = start_at(6)
     improving = [
         observation("marginal", "brighter", median=60.0, peak=70.0 + 15.0 * index)
         for index in range(10)
